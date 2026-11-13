@@ -26,6 +26,12 @@ sed -e "s/__VERSION__/$VERSION/" -e "s/__BUILD__/$BUILD/" Resources/Info.plist >
 [[ -f Resources/AppIcon.icns ]] && cp Resources/AppIcon.icns "$APP/Contents/Resources/" && \
   /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist"
 
+# Prefer a stable identity so macOS keeps Accessibility / Screen Recording grants across
+# rebuilds (ad-hoc signatures change every build). See scripts/make-dev-cert.sh.
+DEV_IDENTITY="MenuBarManager Local Dev"
+if [[ -z "${SIGN_IDENTITY:-}" ]] && security find-identity -p codesigning 2>/dev/null | grep -q "$DEV_IDENTITY"; then
+  SIGN_IDENTITY="$DEV_IDENTITY"
+fi
 IDENTITY="${SIGN_IDENTITY:--}"
 if [[ "$IDENTITY" == "-" ]]; then
   codesign --force --sign - "$APP"
@@ -38,5 +44,5 @@ else
 fi
 
 (cd "$OUT" && rm -f MenuBarManager.zip && ditto -c -k --keepParent "$APP_NAME.app" MenuBarManager.zip)
-echo "Built $APP"
+echo "Built $APP (signed with: $IDENTITY)"
 echo "Zip:  $OUT/MenuBarManager.zip  sha256: $(shasum -a 256 "$OUT/MenuBarManager.zip" | cut -d' ' -f1)"

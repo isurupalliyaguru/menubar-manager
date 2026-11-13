@@ -29,17 +29,33 @@ enum MenuBarItemScanner {
     static func scan() -> [MenuBarItem] {
         let ownPID = ProcessInfo.processInfo.processIdentifier
         var result: [MenuBarItem] = []
+        var problems: [String] = []
 
         for app in NSWorkspace.shared.runningApplications where app.processIdentifier != ownPID {
             let appEl = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(appEl, 0.25)
-            guard let bar: AXUIElement = attr(appEl, "AXExtrasMenuBar"),
-                  let kids: [AXUIElement] = attr(bar, kAXChildrenAttribute) else { continue }
+            AXUIElementSetMessagingTimeout(appEl, 1.0)
+            var barRef: CFTypeRef?
+            let barErr = AXUIElementCopyAttributeValue(appEl, "AXExtrasMenuBar" as CFString, &barRef)
+            guard barErr == .success, let barRef, CFGetTypeID(barRef) == AXUIElementGetTypeID() else {
+                // Most apps simply have no menu bar extra (-25212 / -25205); log anything else.
+                if barErr != .noValue && barErr != .attributeUnsupported && barErr != .success {
+                    problems.append("\(app.localizedName ?? "?") AXExtrasMenuBar error \(barErr.rawValue)")
+                }
+                continue
+            }
+            let bar = barRef as! AXUIElement
+            guard let kids: [AXUIElement] = attr(bar, kAXChildrenAttribute) else {
+                problems.append("\(app.localizedName ?? "?") children unreadable")
+                continue
+            }
 
             let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
             for (index, el) in kids.enumerated() {
-                guard let frame = frame(of: el),
-                      frame.width > 0, frame.minY < 60 else { continue } // skip off-bar placeholders
+                guard let frame = frame(of: el) else {
+                    problems.append("\(app.localizedName ?? "?")#\(index) frame unreadable")
+                    continue
+                }
+                guard frame.width > 0, frame.minY < 60 else { continue } // skip off-bar placeholders
                 let label = [attr(el, kAXTitleAttribute) as String?,
                              attr(el, kAXDescriptionAttribute) as String?,
                              attr(el, kAXHelpAttribute) as String?]
@@ -59,6 +75,7 @@ enum MenuBarItemScanner {
                 ))
             }
         }
+        DiagnosticsLog.write(trusted: AXIsProcessTrusted(), found: result.map { "\($0.id) \($0.frame)" }, problems: problems)
         return result.sorted { $0.frame.minX < $1.frame.minX }
     }
 
@@ -83,5 +100,17 @@ enum MenuBarItemScanner {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(el, name as CFString, &value) == .success else { return nil }
         return value as? T
+    }
+}
+
+/// Writes the latest scan to ~/Library/Logs/MenuBarManager.log so problems can be diagnosed.
+/// Local only; overwritten on every scan.
+enum DiagnosticsLog {
+    static func write(trusted: Bool, found: [String], problems: [String]) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/MenuBarManager.log")
+        let text = (["scan at \(Date()) trusted=\(trusted)", "problems:"] + problems.map { "  " + $0 }
+                    + ["found:"] + found.map { "  " + $0 }).joined(separator: "\n") + "\n"
+        try? text.write(to: url, atomically: true, encoding: .utf8)
     }
 }

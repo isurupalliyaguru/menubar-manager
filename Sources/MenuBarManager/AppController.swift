@@ -38,7 +38,11 @@ final class AppController: NSObject {
         model.onRelaunch = { Self.relaunch() }
 
         if !AXIsProcessTrusted() {
-            requestAccessibility()
+            // Show the system prompt once; after that the panel's banner is the only nag.
+            if !defaults.bool(forKey: "didPromptAccessibility") {
+                defaults.set(true, forKey: "didPromptAccessibility")
+                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+            }
             watchForAccessibilityGrant()
         }
 
@@ -268,7 +272,7 @@ final class AppController: NSObject {
         return (screen.frame.minX + left.maxX)...(screen.frame.minX + right.minX)
     }
 
-    static func overlaps(_ frame: CGRect, _ notch: ClosedRange<CGFloat>?) -> Bool {
+    nonisolated static func overlaps(_ frame: CGRect, _ notch: ClosedRange<CGFloat>?) -> Bool {
         guard let notch else { return false }
         return frame.maxX > notch.lowerBound && frame.minX < notch.upperBound
     }
@@ -285,12 +289,21 @@ final class AppController: NSObject {
 
     // MARK: Collapse state
 
-    private func collapseOrWarn() {
-        if !status.collapse() {
-            let alert = NSAlert()
-            alert.messageText = "Separator is in the wrong place"
-            alert.informativeText = "⌘-drag the │ separator so it sits to the left of the chevron, then choose “Hide icons” from the chevron's right-click menu."
-            alert.runModal()
+    /// Collapses the hidden section. Status item windows get their final positions a moment
+    /// after launch, so retry briefly before concluding the layout is really wrong, and never
+    /// block with a modal dialog (it froze the app when it ended up behind other windows).
+    private func collapseOrWarn(attempt: Int = 0) {
+        if status.collapse() {
+            if model.message?.hasPrefix("The │ separator") == true { model.message = nil }
+            return
+        }
+        if attempt < 10 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self, !self.showAll else { return }
+                self.collapseOrWarn(attempt: attempt + 1)
+            }
+        } else {
+            model.message = "The │ separator is right of the chevron. ⌘-drag it to the left of ⌄ to hide icons."
         }
     }
 
@@ -370,26 +383,28 @@ final class AppController: NSObject {
 
     private func ensureTrusted() -> Bool {
         if AXIsProcessTrusted() { return true }
-        requestAccessibility()
-        model.axTrusted = false
+        model.axTrusted = false   // the panel shows the banner; no extra prompts
         return false
     }
 
     /// Polls until the user flips the switch in System Settings, then refreshes the panel.
     private func watchForAccessibilityGrant() {
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
             guard AXIsProcessTrusted() else { return }
             timer.invalidate()
-            Task { @MainActor in
-                guard let self else { return }
-                self.refresh(captureIcons: true)
-            }
+            // Apps keep answering "not trusted" (kAXErrorAPIDisabled) to a process that was
+            // already running when access was granted, so start fresh.
+            Task { @MainActor in Self.relaunch() }
         }
     }
 
+    /// Only called when the user asks (banner button / menu item).
     private func requestAccessibility() {
         let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        if !AXIsProcessTrustedWithOptions(opts) { openPrivacyPane("Privacy_Accessibility") }
+        if !AXIsProcessTrustedWithOptions(opts) {
+            openPrivacyPane("Privacy_Accessibility")
+            watchForAccessibilityGrant()
+        }
     }
 
     private func openPrivacyPane(_ anchor: String) {
