@@ -14,6 +14,10 @@ final class AppController: NSObject {
     }()
 
     private var outsideClickMonitor: Any?
+    private var scanGeneration = 0
+    /// The bar was expanded only because the dropdown is open.
+    private var previewExpanded = false
+    private var backgroundRefresh: Timer?
     private var rehideMonitor: Any?
     private var menuWatchTimer: Timer?
 
@@ -49,7 +53,8 @@ final class AppController: NSObject {
         // Wait for status items to get windows before checking layout.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let self else { return }
-            Task { await self.captureVisibleIcons() }
+            self.refresh(captureIcons: true)   // warm the cache before the first click
+            self.startBackgroundRefresh()
             if !self.showAll { self.collapseOrWarn() }
         }
     }
@@ -71,15 +76,27 @@ final class AppController: NSObject {
         let y = chevronFrame.minY - size.height - 6
         panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
         panel.makeKeyAndOrderFront(nil)
+        // Reveal the hidden icons while the dropdown is open, so a click doesn't have to
+        // wait for macOS to lay them out again.
+        if status.isCollapsed && !showAll {
+            cancelRehide()
+            status.expand()
+            previewExpanded = true
+        }
 
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             Task { @MainActor in self?.closePanel() }
         }
     }
 
-    private func closePanel() {
+    /// - Parameter keepExpanded: true when an action takes over the expanded bar.
+    private func closePanel(keepExpanded: Bool = false) {
         panel.orderOut(nil)
         if let m = outsideClickMonitor { NSEvent.removeMonitor(m); outsideClickMonitor = nil }
+        if previewExpanded {
+            previewExpanded = false
+            if !keepExpanded && !showAll { status.collapse() }
+        }
     }
 
     private func resizePanelToFit() {
@@ -92,49 +109,107 @@ final class AppController: NSObject {
 
     // MARK: Data
 
-    private func refresh(captureIcons: Bool) {
+    /// Rescans in the background and updates the panel when done. The panel shows the
+    /// previous results immediately, so opening it never waits on the scan.
+    private func refresh(captureIcons: Bool, completion: (() -> Void)? = nil) {
         model.axTrusted = AXIsProcessTrusted()
         model.screenCaptureGranted = icons.hasPermission
-        let sepX = status.cgFrame(of: status.separator)?.minX ?? -.infinity
-        var items = MenuBarItemScanner.scan()
-        for i in items.indices {
-            items[i].section = items[i].frame.midX < sepX ? .hidden : .visible
-            items[i].image = icons.cached(items[i].id)
+        guard model.axTrusted else { model.items = []; completion?(); return }
+        scanGeneration += 1
+        let generation = scanGeneration
+        if model.items.isEmpty { model.busy = true }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let scanned = MenuBarItemScanner.scan()
+            DispatchQueue.main.async {
+                guard let self, generation == self.scanGeneration else { return }
+                let sepX = self.status.cgFrame(of: self.status.separator)?.minX ?? -.infinity
+                var items = scanned
+                for i in items.indices {
+                    items[i].section = items[i].frame.midX < sepX ? .hidden : .visible
+                    items[i].image = self.icons.cached(items[i].id)
+                }
+                self.model.items = items
+                self.model.busy = false
+                DispatchQueue.main.async { self.resizePanelToFit() }
+                if captureIcons { Task { await self.captureVisibleIcons() } }
+                completion?()
+            }
         }
-        model.items = items
-        if ProcessInfo.processInfo.environment["MBM_DEBUG"] != nil {
-            FileHandle.standardError.write("refresh sepX=\(sepX) count=\(items.count)\n".data(using: .utf8)!)
-            for i in items { FileHandle.standardError.write("  \(i.id) \(i.section) \(i.frame)\n".data(using: .utf8)!) }
-        }
-        DispatchQueue.main.async { [weak self] in self?.resizePanelToFit() }
-        if captureIcons { Task { await self.captureVisibleIcons() } }
     }
 
     private func captureVisibleIcons() async {
-        await icons.capture(MenuBarItemScanner.scan())
+        guard icons.hasPermission else { return }
+        // Use the latest scan if we have one; never scan on the main thread.
+        let items: [MenuBarItem]
+        if !model.items.isEmpty {
+            items = model.items.compactMap { item in
+                MenuBarItemScanner.frame(of: item.element).map { f in
+                    var copy = item; copy = MenuBarItem(id: item.id, pid: item.pid, appName: item.appName,
+                        bundleID: item.bundleID, label: item.label, frame: f, element: item.element,
+                        appIcon: item.appIcon, movable: item.movable, section: item.section, image: item.image)
+                    return copy
+                }
+            }
+        } else {
+            items = await Task.detached { MenuBarItemScanner.scan() }.value
+        }
+        await icons.capture(items)
         for i in model.items.indices { model.items[i].image = icons.cached(model.items[i].id) ?? model.items[i].image }
+    }
+
+    /// Keeps the cached icon list fresh so the dropdown opens with current data.
+    private func startBackgroundRefresh() {
+        backgroundRefresh = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, !self.panel.isVisible, AXIsProcessTrusted() else { return }
+                self.refresh(captureIcons: false)
+            }
+        }
     }
 
     // MARK: Actions
 
     /// Opens a hidden item's menu: reveal the hidden section, click the item, hide again afterwards.
     private func activate(_ item: MenuBarItem) {
+        let t0 = Date()
+        func trace(_ m: String) { debugLog(String(format: "activate %@ +%.0fms %@", item.id, Date().timeIntervalSince(t0) * 1000, m)) }
+        trace("start collapsed=\(status.isCollapsed)")
         guard ensureTrusted() else { return }
-        closePanel()
-        let wasCollapsed = status.isCollapsed
-        if wasCollapsed { status.expand() }
+        let wasCollapsed = status.isCollapsed || previewExpanded
+        let alreadyLaidOut = !status.isCollapsed   // expanded while the dropdown was open
+        closePanel(keepExpanded: true)
+        if status.isCollapsed { status.expand() }
 
-        waitUntilOnScreen(item, deadline: Date().addingTimeInterval(1.5)) { [weak self] frame in
+        let settle: (@escaping (CGRect?) -> Void) -> Void = { [weak self] done in
+            if alreadyLaidOut, let f = MenuBarItemScanner.frame(of: item.element), f.minX >= 0 {
+                done(f)
+            } else {
+                self?.waitUntilOnScreen(item, deadline: Date().addingTimeInterval(1.5), completion: done)
+            }
+        }
+        settle { [weak self] frame in
             guard let self else { return }
+            trace("on screen frame=\(String(describing: frame))")
             // Synthetic clicks under the notch are swallowed by the system, so items that
             // land there get an Accessibility "press" instead (the menu still drops down
             // below the notch where it's visible). Everywhere else a real click is the most
             // compatible option.
-            if let frame, !Self.isUnderNotch(frame) {
-                MouseSimulator.click(at: CGPoint(x: frame.midX, y: frame.midY))
-            } else if AXUIElementPerformAction(item.element, kAXPressAction as CFString) != .success, let frame {
-                MouseSimulator.click(at: CGPoint(x: frame.midX, y: frame.midY))
+            // An Accessibility press is instant, doesn't move the pointer, and works behind
+            // the notch. If no menu shows up, fall back to a synthetic click (which macOS
+            // swallows behind the notch, so only where the icon is actually reachable).
+            let clickable = frame.flatMap { Self.isUnderNotch($0) ? nil : $0 }
+            let pressed = AXUIElementPerformAction(item.element, kAXPressAction as CFString) == .success
+            if !pressed, let f = clickable {
+                MouseSimulator.click(at: CGPoint(x: f.midX, y: f.midY))
+            } else if pressed, let f = clickable {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    if !Self.hasOpenMenu(pid: item.pid) {
+                        trace("press showed nothing, clicking")
+                        MouseSimulator.click(at: CGPoint(x: f.midX, y: f.midY))
+                    }
+                }
             }
+            trace("pressed/clicked")
             Task { await self.captureVisibleIcons() } // good moment: everything is on screen
             if wasCollapsed { self.scheduleRehide(pid: item.pid) }
         }
@@ -147,7 +222,7 @@ final class AppController: NSObject {
     /// item's live position until it lands on screen and stops moving.
     private func waitUntilOnScreen(_ item: MenuBarItem, deadline: Date, last: CGRect? = nil,
                                    completion: @escaping (CGRect?) -> Void) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self] in
             guard let self else { return }
             let frame = MenuBarItemScanner.frame(of: item.element)
             if let frame, frame.minX >= 0, frame == last {
@@ -213,9 +288,10 @@ final class AppController: NSObject {
     private func togglePin(_ item: MenuBarItem) {
         guard ensureTrusted(), item.movable else { return }
         let toVisible = item.section == .hidden
-        let wasCollapsed = status.isCollapsed
+        let wasCollapsed = status.isCollapsed || previewExpanded
+        previewExpanded = false        // the pin flow owns the expanded bar now
         cancelRehide()
-        if wasCollapsed { status.expand() }
+        if status.isCollapsed { status.expand() }
         model.busy = true
         model.message = nil
 
@@ -368,6 +444,13 @@ final class AppController: NSObject {
         NSApp.orderFrontStandardAboutPanel(options: [
             .credits: NSAttributedString(string: "github.com/isurupalliyaguru/menubar-manager")
         ])
+    }
+
+    // MARK: Debug
+
+    private func debugLog(_ message: String) {
+        guard ProcessInfo.processInfo.environment["MBM_DEBUG"] != nil else { return }
+        FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
     }
 
     // MARK: Permissions

@@ -24,7 +24,12 @@ keyUsage=critical,digitalSignature
 extendedKeyUsage=critical,codeSigning
 CNF
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -days 3650 -config "$TMP/cert.cnf" 2>/dev/null
-openssl pkcs12 -export -legacy -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p12" -passout pass:tmp 2>/dev/null \
-  || openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p12" -passout pass:tmp
+openssl pkcs12 -export -legacy -name "$NAME" -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p12" -passout pass:tmp 2>/dev/null \
+  || openssl pkcs12 -export -name "$NAME" -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -out "$TMP/id.p12" -passout pass:tmp
 security import "$TMP/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P tmp -T /usr/bin/codesign
+# Let codesign use the key without a keychain prompt on every build (asks for your login
+# password once).
+echo "Allowing codesign to use the key (enter your Mac login password if asked)..."
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -D "$NAME" \
+  "$HOME/Library/Keychains/login.keychain-db" >/dev/null || true
 echo "Created '$NAME'. Build with: SIGN_IDENTITY=\"$NAME\" ./build.sh"

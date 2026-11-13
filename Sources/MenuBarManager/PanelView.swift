@@ -11,6 +11,9 @@ final class PanelModel: ObservableObject {
     @Published var message: String?
     /// macOS only applies a new Screen Recording grant after the app restarts.
     @Published var screenCaptureRequested = false
+    @Published var screenCaptureBannerDismissed = UserDefaults.standard.bool(forKey: "hideScreenCaptureBanner") {
+        didSet { UserDefaults.standard.set(screenCaptureBannerDismissed, forKey: "hideScreenCaptureBanner") }
+    }
 
     var onActivate: ((MenuBarItem) -> Void)?
     var onTogglePin: ((MenuBarItem) -> Void)?
@@ -53,13 +56,14 @@ struct PanelView: View {
                     model.onRequestAX?()
                 }
             } else {
-                if !model.screenCaptureGranted {
+                if !model.screenCaptureGranted && !model.screenCaptureBannerDismissed {
                     if model.screenCaptureRequested {
                         banner("After allowing Screen Recording, relaunch to show real icons.", button: "Relaunch") {
                             model.onRelaunch?()
                         }
                     } else {
-                        banner("Allow Screen Recording to show real icons instead of app icons.", button: "Allow") {
+                        banner("Allow Screen Recording to show real icons instead of app icons.", button: "Allow",
+                               dismiss: { model.screenCaptureBannerDismissed = true }) {
                             model.screenCaptureRequested = true
                             model.onRequestScreenCapture?()
                         }
@@ -98,12 +102,16 @@ struct PanelView: View {
         }
     }
 
-    private func banner(_ text: String, button: String, action: @escaping () -> Void) -> some View {
+    private func banner(_ text: String, button: String, dismiss: (() -> Void)? = nil,
+                        action: @escaping () -> Void) -> some View {
         HStack(alignment: .center, spacing: 8) {
             Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
             Text(text).font(.caption).fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 4)
             Button(button, action: action).controlSize(.small)
+            if let dismiss {
+                Button("Not now", action: dismiss).controlSize(.small).buttonStyle(.borderless)
+            }
         }
         .padding(8)
         .background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.12)))

@@ -26,57 +26,96 @@ struct MenuBarItem: Identifiable {
 
 /// Finds menu bar extras via the Accessibility API (`AXExtrasMenuBar`).
 enum MenuBarItemScanner {
+    /// Processes known to have no menu bar extra, so later scans can skip them.
+    /// Re-checked every 30 s (an app can add a status item at any time).
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var noExtras: Set<pid_t> = []
+    nonisolated(unsafe) private static var noExtrasStamp = Date.distantPast
+
     static func scan() -> [MenuBarItem] {
         let ownPID = ProcessInfo.processInfo.processIdentifier
+
+        cacheLock.lock()
+        if Date().timeIntervalSince(noExtrasStamp) > 30 { noExtras.removeAll(); noExtrasStamp = Date() }
+        let skip = noExtras
+        cacheLock.unlock()
+
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            $0.processIdentifier != ownPID && !skip.contains($0.processIdentifier)
+        }
+
+        // Query every app in parallel with a short timeout, so one unresponsive app
+        // can't stall the whole scan.
+        let lock = NSLock()
         var result: [MenuBarItem] = []
         var problems: [String] = []
+        var empty: [pid_t] = []
 
-        for app in NSWorkspace.shared.runningApplications where app.processIdentifier != ownPID {
-            let appEl = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(appEl, 1.0)
-            var barRef: CFTypeRef?
-            let barErr = AXUIElementCopyAttributeValue(appEl, "AXExtrasMenuBar" as CFString, &barRef)
-            guard barErr == .success, let barRef, CFGetTypeID(barRef) == AXUIElementGetTypeID() else {
-                // Most apps simply have no menu bar extra (-25212 / -25205); log anything else.
-                if barErr != .noValue && barErr != .attributeUnsupported && barErr != .success {
-                    problems.append("\(app.localizedName ?? "?") AXExtrasMenuBar error \(barErr.rawValue)")
-                }
-                continue
-            }
-            let bar = barRef as! AXUIElement
-            guard let kids: [AXUIElement] = attr(bar, kAXChildrenAttribute) else {
-                problems.append("\(app.localizedName ?? "?") children unreadable")
-                continue
-            }
-
-            let appName = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
-            for (index, el) in kids.enumerated() {
-                guard let frame = frame(of: el) else {
-                    problems.append("\(app.localizedName ?? "?")#\(index) frame unreadable")
-                    continue
-                }
-                guard frame.width > 0, frame.minY < 60 else { continue } // skip off-bar placeholders
-                let label = [attr(el, kAXTitleAttribute) as String?,
-                             attr(el, kAXDescriptionAttribute) as String?,
-                             attr(el, kAXHelpAttribute) as String?]
-                    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .first { !$0.isEmpty } ?? ""
-                let key = app.bundleIdentifier ?? appName
-                result.append(MenuBarItem(
-                    id: "\(key)#\(index)",
-                    pid: app.processIdentifier,
-                    appName: appName,
-                    bundleID: app.bundleIdentifier,
-                    label: label,
-                    frame: frame,
-                    element: el,
-                    appIcon: app.icon,
-                    movable: !isFixed(bundleID: app.bundleIdentifier, label: label)
-                ))
-            }
+        DispatchQueue.concurrentPerform(iterations: apps.count) { i in
+            let app = apps[i]
+            let (items, problem, hasNone) = scanApp(app)
+            lock.lock()
+            result += items
+            if let problem { problems.append(problem) }
+            if hasNone { empty.append(app.processIdentifier) }
+            lock.unlock()
         }
+
+        cacheLock.lock()
+        noExtras.formUnion(empty)
+        cacheLock.unlock()
+
         DiagnosticsLog.write(trusted: AXIsProcessTrusted(), found: result.map { "\($0.id) \($0.frame)" }, problems: problems)
         return result.sorted { $0.frame.minX < $1.frame.minX }
+    }
+
+    /// Returns the app's menu bar items, an optional problem description, and whether the
+    /// app definitely has no menu bar extra (safe to skip next time).
+    private static func scanApp(_ app: NSRunningApplication) -> ([MenuBarItem], String?, Bool) {
+        let name = app.localizedName ?? app.bundleIdentifier ?? "Unknown"
+        let appEl = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(appEl, 0.3)
+        var barRef: CFTypeRef?
+        let barErr = AXUIElementCopyAttributeValue(appEl, "AXExtrasMenuBar" as CFString, &barRef)
+        guard barErr == .success, let barRef, CFGetTypeID(barRef) == AXUIElementGetTypeID() else {
+            switch barErr {
+            case .noValue, .attributeUnsupported, .success:
+                return ([], nil, true)            // no menu bar extra
+            case .apiDisabled:
+                return ([], "\(name) AXExtrasMenuBar error \(barErr.rawValue)", false)
+            default:
+                // Timeouts etc.: skip for now (re-checked when the cache expires).
+                return ([], "\(name) AXExtrasMenuBar error \(barErr.rawValue)", true)
+            }
+        }
+        let bar = barRef as! AXUIElement
+        guard let kids: [AXUIElement] = attr(bar, kAXChildrenAttribute) else {
+            return ([], "\(name) children unreadable", false)
+        }
+
+        var items: [MenuBarItem] = []
+        for (index, el) in kids.enumerated() {
+            guard let frame = frame(of: el) else { continue }
+            guard frame.width > 0, frame.minY < 60 else { continue } // skip off-bar placeholders
+            let label = [attr(el, kAXTitleAttribute) as String?,
+                         attr(el, kAXDescriptionAttribute) as String?,
+                         attr(el, kAXHelpAttribute) as String?]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty } ?? ""
+            let key = app.bundleIdentifier ?? name
+            items.append(MenuBarItem(
+                id: "\(key)#\(index)",
+                pid: app.processIdentifier,
+                appName: name,
+                bundleID: app.bundleIdentifier,
+                label: label,
+                frame: frame,
+                element: el,
+                appIcon: app.icon,
+                movable: !isFixed(bundleID: app.bundleIdentifier, label: label)
+            ))
+        }
+        return (items, nil, false)
     }
 
     /// Re-reads an element's live frame (positions change when we expand/collapse).
