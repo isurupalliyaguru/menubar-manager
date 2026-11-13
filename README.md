@@ -47,9 +47,13 @@ Nothing leaves your Mac. The app makes no network requests.
 - The `│` separator is a status item. When "collapsed", its width is set to 10,000 pt, which
   pushes every item to its left off-screen (the same trick Hidden Bar uses).
 - Items are discovered through the Accessibility API (`AXExtrasMenuBar` on each running app).
-- Clicking an icon in the dropdown briefly expands the bar, sends a click to the icon (which
-  works even behind the notch), and collapses the bar again after you're done.
-- Pinning is a synthesized ⌘-drag across the separator, exactly what you'd do by hand.
+- Clicking an icon in the dropdown briefly expands the bar and opens the icon's menu. macOS
+  swallows clicks behind the notch, so icons that land there get an Accessibility "press"
+  instead, and their menu drops down below the notch. The bar collapses again once the menu's
+  window closes.
+- Pinning is a synthesized ⌘-drag across the separator, exactly what you'd do by hand. An icon
+  behind the notch can't be dragged (not even by you), so the app first moves other hidden
+  icons to the far left until it slides out from under the notch.
 - Icon previews use ScreenCaptureKit.
 
 ## Build from source (no Xcode IDE needed)
@@ -80,9 +84,9 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Known limitations
 
-- If the hidden icons don't all fit even when the bar is expanded (for example, while an app
-  with a long menu is in front), macOS drops some of them. The dropdown then falls back to an
-  Accessibility "press", which most apps support.
+- Icons behind the notch are opened with an Accessibility "press". Most apps support it; a few
+  (some Electron apps) may ignore it.
+- Pinning or unpinning briefly moves your mouse pointer, then puts it back.
 - Control Center items can't show real icon previews yet.
 
 ## License

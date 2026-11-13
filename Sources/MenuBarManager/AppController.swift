@@ -15,7 +15,7 @@ final class AppController: NSObject {
 
     private var outsideClickMonitor: Any?
     private var rehideMonitor: Any?
-    private var rehideTimer: Timer?
+    private var menuWatchTimer: Timer?
 
     private let defaults = UserDefaults.standard
     private var showAll: Bool {
@@ -35,8 +35,12 @@ final class AppController: NSObject {
             self?.openPrivacyPane("Privacy_ScreenCapture")
         }
         model.onRefresh = { [weak self] in self?.refresh(captureIcons: true) }
+        model.onRelaunch = { Self.relaunch() }
 
-        if !AXIsProcessTrusted() { requestAccessibility() }
+        if !AXIsProcessTrusted() {
+            requestAccessibility()
+            watchForAccessibilityGrant()
+        }
 
         // Wait for status items to get windows before checking layout.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -94,6 +98,10 @@ final class AppController: NSObject {
             items[i].image = icons.cached(items[i].id)
         }
         model.items = items
+        if ProcessInfo.processInfo.environment["MBM_DEBUG"] != nil {
+            FileHandle.standardError.write("refresh sepX=\(sepX) count=\(items.count)\n".data(using: .utf8)!)
+            for i in items { FileHandle.standardError.write("  \(i.id) \(i.section) \(i.frame)\n".data(using: .utf8)!) }
+        }
         DispatchQueue.main.async { [weak self] in self?.resizePanelToFit() }
         if captureIcons { Task { await self.captureVisibleIcons() } }
     }
@@ -112,31 +120,78 @@ final class AppController: NSObject {
         let wasCollapsed = status.isCollapsed
         if wasCollapsed { status.expand() }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + (wasCollapsed ? 0.35 : 0.05)) { [weak self] in
+        waitUntilOnScreen(item, deadline: Date().addingTimeInterval(1.5)) { [weak self] frame in
             guard let self else { return }
-            Task { await self.captureVisibleIcons() } // good moment: everything is on screen
-            let frame = MenuBarItemScanner.frame(of: item.element) ?? item.frame
-            if frame.minX >= 0 {
+            // Synthetic clicks under the notch are swallowed by the system, so items that
+            // land there get an Accessibility "press" instead (the menu still drops down
+            // below the notch where it's visible). Everywhere else a real click is the most
+            // compatible option.
+            if let frame, !Self.isUnderNotch(frame) {
                 MouseSimulator.click(at: CGPoint(x: frame.midX, y: frame.midY))
-            } else {
-                // Didn't fit on screen even when expanded; ask the app directly.
-                AXUIElementPerformAction(item.element, kAXPressAction as CFString)
+            } else if AXUIElementPerformAction(item.element, kAXPressAction as CFString) != .success, let frame {
+                MouseSimulator.click(at: CGPoint(x: frame.midX, y: frame.midY))
             }
-            if wasCollapsed { self.scheduleRehide() }
+            Task { await self.captureVisibleIcons() } // good moment: everything is on screen
+            if wasCollapsed { self.scheduleRehide(pid: item.pid) }
         }
     }
 
-    /// Collapse again once the user is done with the opened menu (next click anywhere, or a timeout).
-    private func scheduleRehide() {
-        cancelRehide()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+    /// True if a CG-coordinate frame overlaps the camera housing on a notched display.
+    static func isUnderNotch(_ frame: CGRect) -> Bool { overlaps(frame, notchRange()) }
+
+    /// macOS relayouts the bar asynchronously after the separator shrinks, so poll the
+    /// item's live position until it lands on screen and stops moving.
+    private func waitUntilOnScreen(_ item: MenuBarItem, deadline: Date, last: CGRect? = nil,
+                                   completion: @escaping (CGRect?) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
             guard let self else { return }
-            self.rehideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp, .keyDown]) { [weak self] _ in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.rehideNow() }
+            let frame = MenuBarItemScanner.frame(of: item.element)
+            if let frame, frame.minX >= 0, frame == last {
+                completion(frame)
+            } else if Date() > deadline {
+                completion(frame.flatMap { $0.minX >= 0 ? $0 : nil })
+            } else {
+                self.waitUntilOnScreen(item, deadline: deadline, last: frame, completion: completion)
             }
-            self.rehideTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
-                Task { @MainActor in self?.rehideNow() }
+        }
+    }
+
+    /// Collapse again once the user is done with the opened menu.
+    ///
+    /// Primary signal: the app's pop-up menu window appears and then goes away (works no
+    /// matter how the menu is closed: click, Escape, choosing an item). Fallback for apps
+    /// that open something other than a menu: the next click anywhere. Safety net: 5 min.
+    private func scheduleRehide(pid: pid_t) {
+        cancelRehide()
+        var sawMenu = false
+        var elapsed: TimeInterval = 0
+        menuWatchTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                elapsed += 0.3
+                let open = Self.hasOpenMenu(pid: pid)
+                if open { sawMenu = true }
+                if (sawMenu && !open) || elapsed > 300 { self.rehideNow() }
             }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.menuWatchTimer != nil else { return }
+            self.rehideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp, .rightMouseUp]) { [weak self] _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    if !sawMenu { self?.rehideNow() }
+                }
+            }
+        }
+    }
+
+    /// Menus and popovers live in windows above the status bar level, owned by the app.
+    private static func hasOpenMenu(pid: pid_t) -> Bool {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] else { return false }
+        let statusLevel = Int(CGWindowLevelForKey(.statusWindow))
+        return list.contains {
+            ($0[kCGWindowOwnerPID as String] as? pid_t) == pid &&
+            (($0[kCGWindowLayer as String] as? Int) ?? 0) > statusLevel &&
+            (($0[kCGWindowLayer as String] as? Int) ?? 0) < Int(CGWindowLevelForKey(.screenSaverWindow))
         }
     }
 
@@ -147,7 +202,7 @@ final class AppController: NSObject {
 
     private func cancelRehide() {
         if let m = rehideMonitor { NSEvent.removeMonitor(m); rehideMonitor = nil }
-        rehideTimer?.invalidate(); rehideTimer = nil
+        menuWatchTimer?.invalidate(); menuWatchTimer = nil
     }
 
     /// Moves an item across the separator with a synthetic ⌘-drag.
@@ -160,27 +215,62 @@ final class AppController: NSObject {
         model.busy = true
         model.message = nil
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+        waitUntilOnScreen(item, deadline: Date().addingTimeInterval(1.5)) { [weak self] from in
             guard let self else { return }
-            guard let from = MenuBarItemScanner.frame(of: item.element),
-                  let sep = self.status.cgFrame(of: self.status.separator) else {
+            guard let from, self.status.cgFrame(of: self.status.separator) != nil else {
                 self.finishPin(wasCollapsed: wasCollapsed, error: "Couldn't find that icon. Try refreshing.")
                 return
             }
-            let start = CGPoint(x: from.midX, y: from.midY)
-            let end = CGPoint(x: toVisible ? sep.maxX + 2 : sep.minX - 2, y: sep.midY)
+            let notch = Self.notchRange()
+            let separatorFrame: () -> CGRect = { [weak self] in
+                DispatchQueue.main.sync { self?.status.cgFrame(of: self!.status.separator) ?? .zero }
+            }
             DispatchQueue.global(qos: .userInitiated).async {
-                MouseSimulator.commandDrag(from: start, to: end)
+                var frame = from
+                // Nothing (not even a person) can drag an icon that sits behind the notch.
+                // Make room instead: move hidden icons that ARE reachable to the far left,
+                // one by one, until this icon slides out from under the notch.
+                if let notch {
+                    var attempts = 0
+                    while Self.overlaps(frame, notch) && attempts < 15 {
+                        attempts += 1
+                        let sepMinX = separatorFrame().minX
+                        guard let mover = MenuBarItemScanner.scan().first(where: {
+                            $0.id != item.id && $0.movable && $0.frame.minX >= notch.upperBound && $0.frame.maxX <= sepMinX
+                        }) else { break }
+                        MouseSimulator.commandDrag(from: CGPoint(x: mover.frame.midX, y: mover.frame.midY),
+                                                   to: CGPoint(x: notch.lowerBound - 40, y: mover.frame.midY))
+                        usleep(350_000)
+                        frame = MenuBarItemScanner.frame(of: item.element) ?? frame
+                    }
+                }
+                let sep = separatorFrame()
+                if !Self.overlaps(frame, notch) && frame.minX >= 0 {
+                    MouseSimulator.commandDrag(from: CGPoint(x: frame.midX, y: frame.midY),
+                                               to: CGPoint(x: toVisible ? sep.maxX + 2 : sep.minX - 2, y: sep.midY))
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self else { return }
                     let moved = MenuBarItemScanner.frame(of: item.element).map { f -> Bool in
                         let nowVisible = f.midX >= (self.status.cgFrame(of: self.status.separator)?.minX ?? 0)
                         return nowVisible == toVisible
                     } ?? false
-                    self.finishPin(wasCollapsed: wasCollapsed, error: moved ? nil : "macOS didn't move that icon. Try ⌘-dragging it manually.")
+                    self.finishPin(wasCollapsed: wasCollapsed, error: moved ? nil : "Couldn't move that icon. Try again, or ⌘-drag it across the │ separator.")
                 }
             }
         }
+    }
+
+    /// Horizontal span of the notch in global coordinates, or nil on displays without one.
+    static func notchRange() -> ClosedRange<CGFloat>? {
+        guard let screen = NSScreen.screens.first(where: { $0.auxiliaryTopLeftArea != nil }),
+              let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea else { return nil }
+        return (screen.frame.minX + left.maxX)...(screen.frame.minX + right.minX)
+    }
+
+    static func overlaps(_ frame: CGRect, _ notch: ClosedRange<CGFloat>?) -> Bool {
+        guard let notch else { return false }
+        return frame.maxX > notch.lowerBound && frame.minX < notch.upperBound
     }
 
     private func finishPin(wasCollapsed: Bool, error: String?) {
@@ -269,11 +359,32 @@ final class AppController: NSObject {
 
     // MARK: Permissions
 
+    static func relaunch() {
+        let path = Bundle.main.bundlePath
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", "sleep 0.5; open -n \"$0\"", path]
+        try? task.run()
+        NSApp.terminate(nil)
+    }
+
     private func ensureTrusted() -> Bool {
         if AXIsProcessTrusted() { return true }
         requestAccessibility()
         model.axTrusted = false
         return false
+    }
+
+    /// Polls until the user flips the switch in System Settings, then refreshes the panel.
+    private func watchForAccessibilityGrant() {
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            guard AXIsProcessTrusted() else { return }
+            timer.invalidate()
+            Task { @MainActor in
+                guard let self else { return }
+                self.refresh(captureIcons: true)
+            }
+        }
     }
 
     private func requestAccessibility() {

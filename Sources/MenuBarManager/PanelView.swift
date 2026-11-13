@@ -9,12 +9,15 @@ final class PanelModel: ObservableObject {
     @Published var screenCaptureGranted = true
     @Published var busy = false
     @Published var message: String?
+    /// macOS only applies a new Screen Recording grant after the app restarts.
+    @Published var screenCaptureRequested = false
 
     var onActivate: ((MenuBarItem) -> Void)?
     var onTogglePin: ((MenuBarItem) -> Void)?
     var onRequestAX: (() -> Void)?
     var onRequestScreenCapture: (() -> Void)?
     var onRefresh: (() -> Void)?
+    var onRelaunch: (() -> Void)?
 
     private func filtered(_ s: MenuBarItem.Section) -> [MenuBarItem] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
@@ -45,18 +48,27 @@ struct PanelView: View {
             .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.06)))
 
             if !model.axTrusted {
-                banner("Accessibility access is needed to click and reorder icons.", button: "Grant access") {
+                banner("Turn on MenuBar Manager in Privacy & Security → Accessibility. If it's already on, select it, remove it with −, and grant again.",
+                       button: "Open settings") {
                     model.onRequestAX?()
                 }
-            } else if !model.screenCaptureGranted {
-                banner("Allow Screen Recording to show real icons instead of app icons.", button: "Allow") {
-                    model.onRequestScreenCapture?()
+            } else {
+                if !model.screenCaptureGranted {
+                    if model.screenCaptureRequested {
+                        banner("After allowing Screen Recording, relaunch to show real icons.", button: "Relaunch") {
+                            model.onRelaunch?()
+                        }
+                    } else {
+                        banner("Allow Screen Recording to show real icons instead of app icons.", button: "Allow") {
+                            model.screenCaptureRequested = true
+                            model.onRequestScreenCapture?()
+                        }
+                    }
                 }
+                section("Hidden", items: model.hidden, empty: "No hidden icons. Click a pin to hide one.")
+                Divider()
+                section("Always visible", items: model.visible, empty: "Nothing pinned.")
             }
-
-            section("Hidden", items: model.hidden, empty: "No hidden icons. Click a pin to hide one.")
-            Divider()
-            section("Always visible", items: model.visible, empty: "Nothing pinned.")
 
             if let message = model.message {
                 Text(message).font(.caption).foregroundStyle(.orange)

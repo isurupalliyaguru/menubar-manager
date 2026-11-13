@@ -25,7 +25,9 @@ enum MouseSimulator {
     /// Blocking; call off the main thread.
     static func commandDrag(from start: CGPoint, to end: CGPoint) {
         let original = cursorLocation
-        post(.mouseMoved, at: start, button: .left)
+        defer { setModifierFlags([]) } // never leave ⌘ "stuck" for the user
+        setModifierFlags(.maskCommand)
+        post(.mouseMoved, at: start, button: .left, flags: .maskCommand)
         usleep(30_000)
         post(.leftMouseDown, at: start, button: .left, flags: .maskCommand)
         usleep(150_000)
@@ -40,6 +42,14 @@ enum MouseSimulator {
         post(.leftMouseUp, at: end, button: .left, flags: .maskCommand)
         usleep(50_000)
         CGWarpMouseCursorPosition(original)
+    }
+
+    private static func setModifierFlags(_ flags: CGEventFlags) {
+        guard let e = CGEvent(source: source) else { return }
+        e.type = .flagsChanged
+        e.flags = flags
+        e.post(tap: .cghidEventTap)
+        usleep(20_000)
     }
 
     private static func post(_ type: CGEventType, at p: CGPoint, button: CGMouseButton, flags: CGEventFlags = []) {
